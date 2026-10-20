@@ -11,6 +11,10 @@ const ALGORITHMS = [
   'ES256', 'ES384', 'ES512',
 ];
 
+const HMAC_ALGORITHMS = ['HS256', 'HS384', 'HS512'];
+const RSA_ALGORITHMS = ['RS256', 'RS384', 'RS512'];
+const ECDSA_ALGORITHMS = ['ES256', 'ES384', 'ES512'];
+
 function toString(obj) {
   if (typeof obj === 'string')
     return obj;
@@ -78,6 +82,23 @@ function signatureFromJWS(jwsSig) {
   return jwsSig.split('.')[2];
 }
 
+// CVE-2016-1000223: the algorithms a given secret or key may be used with.
+// When jws.verify is called without an explicit algorithm the token header
+// may only pick an algorithm from the family of the supplied key material,
+// so a forged token can neither turn a PEM public key into an HMAC secret
+// nor drop the signature with `alg: none`.
+function algorithmsForKey(secretOrKey) {
+  const key = secretOrKey == null ? '' : secretOrKey.toString();
+  const pem = key.match(/-----BEGIN ([A-Z ]+?)-----/);
+  if (!pem)
+    return HMAC_ALGORITHMS;
+  if (/^RSA /.test(pem[1]))
+    return RSA_ALGORITHMS;
+  if (/^EC /.test(pem[1]))
+    return ECDSA_ALGORITHMS;
+  return RSA_ALGORITHMS.concat(ECDSA_ALGORITHMS);
+}
+
 function payloadFromJWS(jwsSig) {
   const payload = jwsSig.split('.')[1];
   return base64url.decode(payload);
@@ -92,11 +113,32 @@ function isValidJws(string) {
   return true;
 }
 
-function jwsVerify(jwsSig, secretOrKey) {
+// jws.verify(signature, secretOrKey)            - algorithm taken from the header
+// jws.verify(signature, algorithm, secretOrKey) - explicit algorithm (jws >= 3.0.0)
+function jwsVerify(jwsSig, algorithm, secretOrKey) {
+  var err;
   jwsSig = toString(jwsSig);
+  if (arguments.length < 3) {
+    secretOrKey = algorithm;
+    algorithm = algoFromJWS(jwsSig);
+    // with no key at all only an unsigned token can be checked; with a key the
+    // header may only name an algorithm that key is good for
+    const allowed = arguments.length < 2 ? ['NONE'] : algorithmsForKey(secretOrKey);
+    if (allowed.indexOf(String(algorithm).toUpperCase()) === -1)
+      return false;
+  }
+  else {
+    if (!algorithm) {
+      err = new Error("Missing algorithm parameter for jws.verify");
+      err.code = "MISSING_ALGORITHM";
+      throw err;
+    }
+    if (ALGORITHMS.indexOf(algorithm) === -1 && algorithm !== 'none')
+      throw new TypeError('"' + algorithm + '" is not a valid algorithm.');
+  }
   const signature = signatureFromJWS(jwsSig);
   const securedInput = securedInputFromJWS(jwsSig);
-  const algo = jwa(algoFromJWS(jwsSig));
+  const algo = jwa(algorithm);
   return algo.verify(securedInput, signature, secretOrKey);
 }
 
@@ -154,6 +196,7 @@ function VerifyStream(opts) {
   const secretOrKey = opts.secret||opts.publicKey||opts.key;
   const secretStream = new DataStream(secretOrKey);
   this.readable = true;
+  this.algorithm = opts.algorithm;
   this.secret = this.publicKey = this.key = secretStream;
   this.signature = new DataStream(opts.signature);
   this.secret.once('close', function () {
@@ -168,7 +211,9 @@ function VerifyStream(opts) {
 }
 util.inherits(VerifyStream, Stream);
 VerifyStream.prototype.verify = function verify() {
-  const valid = jwsVerify(this.signature.buffer, this.key.buffer);
+  const valid = this.algorithm == null
+    ? jwsVerify(this.signature.buffer, this.key.buffer)
+    : jwsVerify(this.signature.buffer, this.algorithm, this.key.buffer);
   const obj = jwsDecode(this.signature.buffer);
   this.emit('done', valid, obj);
   this.emit('data', valid);
